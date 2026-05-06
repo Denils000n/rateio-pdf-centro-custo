@@ -7,16 +7,21 @@ from io import BytesIO
 st.set_page_config(page_title="Rateio PDF - Centro de Custo", layout="wide")
 
 st.title("📄 Rateio por Centro de Custo - PDF")
-st.write("Envie a fatura em PDF para calcular quantidade por centro de custo e valor a pagar.")
 
+
+# ----------------------------
+# FUNÇÕES
+# ----------------------------
 
 def converter_brl_para_float(valor):
     if valor is None:
         return 0.0
 
     valor = str(valor).strip()
-    valor = valor.replace("R$", "").replace(" ", "")
-    valor = valor.replace(".", "").replace(",", ".")
+    valor = valor.replace("R$", "")
+    valor = valor.replace(" ", "")  # remove espaço quebrado do PDF
+    valor = valor.replace(".", "")
+    valor = valor.replace(",", ".")
 
     try:
         return float(valor)
@@ -29,11 +34,10 @@ def formatar_brl(valor):
 
 
 def extrair_total_fatura(texto_total):
-    padrao = r"Total\s*Fatura[:\s]*R\$\s*([\d\.,]+)"
-    encontrado = re.search(padrao, texto_total, flags=re.IGNORECASE)
+    match = re.search(r"Total\s*Fatura[:\s]*R\$\s*([\d\.\s]+,\d{2})", texto_total, re.IGNORECASE)
 
-    if encontrado:
-        return converter_brl_para_float(encontrado.group(1))
+    if match:
+        return converter_brl_para_float(match.group(1))
 
     return 0.0
 
@@ -43,7 +47,7 @@ def extrair_dados_pdf(arquivo_pdf):
     texto_total = ""
 
     with pdfplumber.open(arquivo_pdf) as pdf:
-        for numero_pagina, pagina in enumerate(pdf.pages, start=1):
+        for pagina in pdf.pages:
             texto = pagina.extract_text()
 
             if not texto:
@@ -54,26 +58,27 @@ def extrair_dados_pdf(arquivo_pdf):
             for linha in texto.split("\n"):
                 linha = linha.strip()
 
-                # Considera apenas linhas reais de item
+                # Considera apenas linhas reais de item (sempre começam com número)
                 if not linha.startswith("1 "):
                     continue
 
-                # Centro de custo no padrão EC-XXX
-                centro_match = re.search(r"EC-(\d{3})", linha, flags=re.IGNORECASE)
+                # Centro de custo
+                cc_match = re.search(r"EC-(\d{3})", linha, re.IGNORECASE)
 
-                # Pega o último valor em R$ da linha
-                valores = re.findall(r"R\$\s*([\d\.,]+)", linha)
+                # Valor (corrigido para pegar "R$ 1 98,00")
+                valor_match = re.findall(r"R\$\s*([\d\.\s]+,\d{2})", linha)
 
-                if centro_match and valores:
-                    centro_custo = centro_match.group(1)
-                    valor = converter_brl_para_float(valores[-1])
+                if cc_match and valor_match:
+                    centro = cc_match.group(1)
+
+                    # pega o último valor da linha (mais seguro)
+                    valor = converter_brl_para_float(valor_match[-1])
 
                     registros.append({
-                        "Página": numero_pagina,
-                        "Centro de Custo": centro_custo,
+                        "Centro de Custo": centro,
                         "Qtd": 1,
                         "Valor": valor,
-                        "Linha Extraída": linha
+                        "Linha": linha
                     })
 
     total_fatura = extrair_total_fatura(texto_total)
@@ -81,128 +86,125 @@ def extrair_dados_pdf(arquivo_pdf):
     return pd.DataFrame(registros), total_fatura
 
 
-arquivo_pdf = st.file_uploader(
-    "📁 Envie a fatura em PDF",
-    type=["pdf"]
-)
+# ----------------------------
+# APP
+# ----------------------------
+
+arquivo_pdf = st.file_uploader("📁 Envie o PDF da fatura", type=["pdf"])
 
 if arquivo_pdf:
-    st.success("PDF carregado com sucesso!")
 
     df, total_fatura = extrair_dados_pdf(arquivo_pdf)
 
     if df.empty:
-        st.error("Não consegui identificar os itens da fatura no PDF.")
+        st.error("Não consegui ler o PDF corretamente.")
         st.stop()
 
     resumo = df.groupby("Centro de Custo").agg(
         qtd_usuarios=("Qtd", "sum"),
-        valor_a_pagar=("Valor", "sum")
+        valor=("Valor", "sum")
     ).reset_index()
 
     resumo["Centro de Custo"] = resumo["Centro de Custo"].astype(int)
     resumo = resumo.sort_values("Centro de Custo")
     resumo["Centro de Custo"] = resumo["Centro de Custo"].astype(str)
 
-    resumo["Valor Formatado"] = resumo["valor_a_pagar"].apply(formatar_brl)
+    resumo["Valor Formatado"] = resumo["valor"].apply(formatar_brl)
 
-    soma_itens = resumo["valor_a_pagar"].sum()
+    soma_itens = resumo["valor"].sum()
     divergencia = round(total_fatura - soma_itens, 2)
 
-    st.subheader("📊 Validação da fatura")
+    # ----------------------------
+    # DASHBOARD
+    # ----------------------------
+
+    st.subheader("📊 Validação")
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Centros de custo", resumo["Centro de Custo"].nunique())
-    col2.metric("Total usuários", int(resumo["qtd_usuarios"].sum()))
-    col3.metric("Soma dos itens", formatar_brl(soma_itens))
-    col4.metric("Total da fatura", formatar_brl(total_fatura))
+
+    col1.metric("Centros", resumo.shape[0])
+    col2.metric("Usuários", int(resumo["qtd_usuarios"].sum()))
+    col3.metric("Soma Itens", formatar_brl(soma_itens))
+    col4.metric("Fatura", formatar_brl(total_fatura))
 
     if total_fatura > 0:
         if abs(divergencia) <= 0.05:
-            st.success("✅ A soma dos itens bate com o total da fatura.")
+            st.success("✅ Valores batem com a fatura")
         else:
-            st.error(f"⚠️ Divergência encontrada: {formatar_brl(divergencia)}")
-    else:
-        st.warning("Não consegui identificar automaticamente o total da fatura.")
+            st.error(f"⚠️ Divergência: {formatar_brl(divergencia)}")
 
-    st.subheader("📌 Resumo por centro de custo")
+    # ----------------------------
+    # RESULTADO
+    # ----------------------------
 
-    for _, row in resumo.iterrows():
-        texto_usuario = "usuário" if int(row["qtd_usuarios"]) == 1 else "usuários"
-
-        st.success(
-            f"• {row['Centro de Custo']} – "
-            f"{int(row['qtd_usuarios'])} {texto_usuario} | "
-            f"Valor a pagar: {row['Valor Formatado']}"
-        )
-
-    tabela_final = resumo[[
-        "Centro de Custo",
-        "qtd_usuarios",
-        "valor_a_pagar"
-    ]].copy()
-
-    tabela_final.columns = [
-        "Centro de Custo",
-        "Qtd Usuários",
-        "Valor a Pagar"
-    ]
-
-    tabela_final["Valor a Pagar"] = tabela_final["Valor a Pagar"].round(2)
-
-    st.subheader("📑 Tabela final")
-    st.dataframe(tabela_final, use_container_width=True)
-
-    st.subheader("📋 Base extraída do PDF")
-    st.dataframe(df, use_container_width=True)
-
-    st.subheader("📧 Texto para copiar e colar no e-mail")
+    st.subheader("📌 Rateio por Centro de Custo")
 
     linhas_email = []
 
     for _, row in resumo.iterrows():
-        texto_usuario = "usuário" if int(row["qtd_usuarios"]) == 1 else "usuários"
+        usuarios = int(row["qtd_usuarios"])
+        texto_usuario = "usuário" if usuarios == 1 else "usuários"
 
-        linhas_email.append(
+        linha = (
             f"• {row['Centro de Custo']} – "
-            f"{int(row['qtd_usuarios'])} {texto_usuario} | "
+            f"{usuarios} {texto_usuario} | "
             f"Valor a pagar: {row['Valor Formatado']}"
         )
+
+        st.success(linha)
+        linhas_email.append(linha)
+
+    # ----------------------------
+    # EMAIL
+    # ----------------------------
+
+    st.subheader("📧 Texto para e-mail")
 
     texto_email = (
         "Prezados,\n\n"
         "Segue abaixo o rateio atualizado por centro de custo:\n\n"
         + "\n".join(linhas_email)
-        + "\n\n"
-        "Fico à disposição para qualquer dúvida."
+        + "\n\nFico à disposição para qualquer dúvida."
     )
 
-    st.text_area(
-        "Copie o texto abaixo:",
-        value=texto_email,
-        height=400
-    )
+    st.text_area("Copiar:", texto_email, height=400)
 
-    validacao = pd.DataFrame([{
-        "Soma dos Itens": soma_itens,
-        "Total da Fatura": total_fatura,
-        "Divergência": divergencia,
-        "Status": "OK" if abs(divergencia) <= 0.05 else "Divergente"
-    }])
+    # ----------------------------
+    # TABELA
+    # ----------------------------
+
+    tabela = resumo[[
+        "Centro de Custo",
+        "qtd_usuarios",
+        "valor"
+    ]].copy()
+
+    tabela.columns = [
+        "Centro de Custo",
+        "Qtd Usuários",
+        "Valor a Pagar"
+    ]
+
+    tabela["Valor a Pagar"] = tabela["Valor a Pagar"].round(2)
+
+    st.subheader("📑 Tabela")
+    st.dataframe(tabela, use_container_width=True)
+
+    # ----------------------------
+    # DOWNLOAD
+    # ----------------------------
 
     buffer = BytesIO()
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        tabela_final.to_excel(writer, index=False, sheet_name="Rateio")
-        df.to_excel(writer, index=False, sheet_name="Base_Extraida")
-        validacao.to_excel(writer, index=False, sheet_name="Validacao")
+        tabela.to_excel(writer, index=False, sheet_name="Rateio")
+        df.to_excel(writer, index=False, sheet_name="Base")
 
     st.download_button(
-        label="📥 Baixar Excel",
-        data=buffer.getvalue(),
-        file_name="rateio_centro_custo.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "📥 Baixar Excel",
+        buffer.getvalue(),
+        "rateio.xlsx"
     )
 
 else:
-    st.info("Envie o PDF mensal para iniciar.")
+    st.info("Envie o PDF para iniciar")
