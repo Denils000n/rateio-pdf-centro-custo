@@ -7,10 +7,7 @@ from io import BytesIO
 st.set_page_config(page_title="Rateio PDF - Centro de Custo", layout="wide")
 
 st.title("📄 Rateio por Centro de Custo - PDF")
-st.write(
-    "Envie a fatura em PDF para calcular quantidade de usuários/equipamentos "
-    "por centro de custo e valor a pagar."
-)
+st.write("Envie a fatura em PDF para calcular quantidade por centro de custo e valor a pagar.")
 
 
 def converter_brl_para_float(valor):
@@ -31,22 +28,12 @@ def formatar_brl(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def extrair_valor_total_fatura(texto_total):
-    padroes = [
-        r"Total\s*Fatura[:\s]*R\$\s*([\d\.,]+)",
-        r"Valor\s*R\$\s*([\d\.,]+)",
-        r"R\$\s*([\d\.,]+)\s*\d{2}/\d{2}/\d{4}"
-    ]
+def extrair_total_fatura(texto_total):
+    padrao = r"Total\s*Fatura[:\s]*R\$\s*([\d\.,]+)"
+    encontrado = re.search(padrao, texto_total, flags=re.IGNORECASE)
 
-    valores = []
-
-    for padrao in padroes:
-        encontrados = re.findall(padrao, texto_total, flags=re.IGNORECASE)
-        for valor in encontrados:
-            valores.append(converter_brl_para_float(valor))
-
-    if valores:
-        return max(valores)
+    if encontrado:
+        return converter_brl_para_float(encontrado.group(1))
 
     return 0.0
 
@@ -63,20 +50,23 @@ def extrair_dados_pdf(arquivo_pdf):
                 continue
 
             texto_total += texto + "\n"
-            linhas = texto.split("\n")
 
-            for linha in linhas:
+            for linha in texto.split("\n"):
                 linha = linha.strip()
 
-                if "Notebook" not in linha and "Notebool" not in linha:
+                # Considera apenas linhas reais de item
+                if not linha.startswith("1 "):
                     continue
 
-                cc_match = re.search(r"(EC-\d{3})", linha, flags=re.IGNORECASE)
-                valor_match = re.search(r"R\$\s*([\d\.,]+)", linha)
+                # Centro de custo no padrão EC-XXX
+                centro_match = re.search(r"EC-(\d{3})", linha, flags=re.IGNORECASE)
 
-                if cc_match and valor_match:
-                    centro_custo = cc_match.group(1).upper()
-                    valor = converter_brl_para_float(valor_match.group(1))
+                # Pega o último valor em R$ da linha
+                valores = re.findall(r"R\$\s*([\d\.,]+)", linha)
+
+                if centro_match and valores:
+                    centro_custo = centro_match.group(1)
+                    valor = converter_brl_para_float(valores[-1])
 
                     registros.append({
                         "Página": numero_pagina,
@@ -86,9 +76,9 @@ def extrair_dados_pdf(arquivo_pdf):
                         "Linha Extraída": linha
                     })
 
-    valor_total_fatura = extrair_valor_total_fatura(texto_total)
+    total_fatura = extrair_total_fatura(texto_total)
 
-    return pd.DataFrame(registros), valor_total_fatura
+    return pd.DataFrame(registros), total_fatura
 
 
 arquivo_pdf = st.file_uploader(
@@ -99,11 +89,10 @@ arquivo_pdf = st.file_uploader(
 if arquivo_pdf:
     st.success("PDF carregado com sucesso!")
 
-    df, valor_total_fatura = extrair_dados_pdf(arquivo_pdf)
+    df, total_fatura = extrair_dados_pdf(arquivo_pdf)
 
     if df.empty:
         st.error("Não consegui identificar os itens da fatura no PDF.")
-        st.warning("Verifique se o PDF segue o mesmo modelo da fatura base.")
         st.stop()
 
     resumo = df.groupby("Centro de Custo").agg(
@@ -111,42 +100,39 @@ if arquivo_pdf:
         valor_a_pagar=("Valor", "sum")
     ).reset_index()
 
+    resumo["Centro de Custo"] = resumo["Centro de Custo"].astype(int)
     resumo = resumo.sort_values("Centro de Custo")
+    resumo["Centro de Custo"] = resumo["Centro de Custo"].astype(str)
+
     resumo["Valor Formatado"] = resumo["valor_a_pagar"].apply(formatar_brl)
 
-    total_usuarios = int(resumo["qtd_usuarios"].sum())
-    total_valor_itens = resumo["valor_a_pagar"].sum()
-    total_centros = resumo["Centro de Custo"].nunique()
-    divergencia = round(valor_total_fatura - total_valor_itens, 2)
+    soma_itens = resumo["valor_a_pagar"].sum()
+    divergencia = round(total_fatura - soma_itens, 2)
 
     st.subheader("📊 Validação da fatura")
 
     col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Centros de custo", resumo["Centro de Custo"].nunique())
+    col2.metric("Total usuários", int(resumo["qtd_usuarios"].sum()))
+    col3.metric("Soma dos itens", formatar_brl(soma_itens))
+    col4.metric("Total da fatura", formatar_brl(total_fatura))
 
-    col1.metric("Centros de custo", total_centros)
-    col2.metric("Total usuários/equipamentos", total_usuarios)
-    col3.metric("Soma dos itens", formatar_brl(total_valor_itens))
-    col4.metric("Total da fatura", formatar_brl(valor_total_fatura))
-
-    if valor_total_fatura == 0:
-        st.warning("Não consegui identificar automaticamente o valor total da fatura no PDF.")
-    elif abs(divergencia) <= 0.05:
-        st.success("✅ Validação OK: a soma dos itens bate com o total da fatura.")
+    if total_fatura > 0:
+        if abs(divergencia) <= 0.05:
+            st.success("✅ A soma dos itens bate com o total da fatura.")
+        else:
+            st.error(f"⚠️ Divergência encontrada: {formatar_brl(divergencia)}")
     else:
-        st.error(
-            f"⚠️ Divergência encontrada: diferença de {formatar_brl(divergencia)} "
-            f"entre a soma dos itens e o total da fatura."
-        )
-
-    st.subheader("📋 Base extraída do PDF")
-    st.dataframe(df, use_container_width=True)
+        st.warning("Não consegui identificar automaticamente o total da fatura.")
 
     st.subheader("📌 Resumo por centro de custo")
 
     for _, row in resumo.iterrows():
+        texto_usuario = "usuário" if int(row["qtd_usuarios"]) == 1 else "usuários"
+
         st.success(
             f"• {row['Centro de Custo']} – "
-            f"{int(row['qtd_usuarios'])} usuário(s) | "
+            f"{int(row['qtd_usuarios'])} {texto_usuario} | "
             f"Valor a pagar: {row['Valor Formatado']}"
         )
 
@@ -167,14 +153,19 @@ if arquivo_pdf:
     st.subheader("📑 Tabela final")
     st.dataframe(tabela_final, use_container_width=True)
 
+    st.subheader("📋 Base extraída do PDF")
+    st.dataframe(df, use_container_width=True)
+
     st.subheader("📧 Texto para copiar e colar no e-mail")
 
     linhas_email = []
 
     for _, row in resumo.iterrows():
+        texto_usuario = "usuário" if int(row["qtd_usuarios"]) == 1 else "usuários"
+
         linhas_email.append(
             f"• {row['Centro de Custo']} – "
-            f"{int(row['qtd_usuarios'])} usuário(s) | "
+            f"{int(row['qtd_usuarios'])} {texto_usuario} | "
             f"Valor a pagar: {row['Valor Formatado']}"
         )
 
@@ -189,17 +180,17 @@ if arquivo_pdf:
     st.text_area(
         "Copie o texto abaixo:",
         value=texto_email,
-        height=350
+        height=400
     )
 
-    buffer = BytesIO()
-
     validacao = pd.DataFrame([{
-        "Soma dos Itens": total_valor_itens,
-        "Total da Fatura": valor_total_fatura,
+        "Soma dos Itens": soma_itens,
+        "Total da Fatura": total_fatura,
         "Divergência": divergencia,
         "Status": "OK" if abs(divergencia) <= 0.05 else "Divergente"
     }])
+
+    buffer = BytesIO()
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         tabela_final.to_excel(writer, index=False, sheet_name="Rateio")
@@ -214,4 +205,4 @@ if arquivo_pdf:
     )
 
 else:
-    st.info("Envie o PDF mensal para iniciar o cálculo.")
+    st.info("Envie o PDF mensal para iniciar.")
